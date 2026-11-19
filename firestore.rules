@@ -1,0 +1,60 @@
+rules_version = '2';
+// M K Fashion Vendor Payables: Cloud Firestore security rules.
+// Paste this whole file into Firebase console > Firestore Database > Rules, then Publish.
+//
+// Who can do what:
+//   Not signed in, or signed in but not in /users      : nothing at all
+//   viewer : read bills, vendors, settings
+//   editor : viewer + add and edit bills, payments, vendors, write activity log
+//   admin  : editor + delete, change settings, manage the team, read activity log
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function myEmail() { return request.auth.token.email.lower(); }
+    function signedIn() { return request.auth != null && request.auth.token.email_verified == true; }
+    function myDoc() { return /databases/$(database)/documents/users/$(myEmail()); }
+    function isMember() { return signedIn() && exists(myDoc()) && get(myDoc()).data.active == true; }
+    function myRole() { return get(myDoc()).data.role; }
+    function canEdit() { return isMember() && myRole() in ['admin', 'editor']; }
+    function isAdmin() { return isMember() && myRole() == 'admin'; }
+
+    match /users/{email} {
+      allow read: if (signedIn() && email == myEmail()) || isAdmin();
+      allow create, delete: if isAdmin();
+      // A member may only change their own PIN and last seen time, never their role.
+      allow update: if isAdmin()
+        || (isMember() && email == myEmail()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pinHash', 'lastSeen']));
+    }
+
+    match /vendors/{id} {
+      allow read: if isMember();
+      allow create, update: if canEdit();
+      allow delete: if isAdmin();
+    }
+
+    match /bills/{id} {
+      allow read: if isMember();
+      allow create, update: if canEdit()
+        && request.resource.data.dept in ['GREIGE', 'PROCESS']
+        && request.resource.data.invAmt is number;
+      allow delete: if isAdmin();
+    }
+
+    match /settings/{id} {
+      allow read: if isMember();
+      allow write: if isAdmin();
+    }
+
+    match /logs/{id} {
+      allow read: if isAdmin();
+      allow create: if canEdit() && request.resource.data.by == myEmail();
+      allow update, delete: if false;
+    }
+
+    // Anything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
