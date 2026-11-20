@@ -43,7 +43,8 @@ service cloud.firestore {
 
     match /settings/{id} {
       allow read: if isMember();
-      allow write: if isAdmin();
+      // "app" holds business settings (admins only). "sync" holds the OneDrive file and last sync record.
+      allow write: if isAdmin() || (id == 'sync' && canEdit());
     }
 
     match /logs/{id} {

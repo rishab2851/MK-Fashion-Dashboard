@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>Connecting OneDrive…</title>
+<style>body{font-family:system-ui,sans-serif;background:#81160E;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0;text-align:center;padding:20px}</style></head>
+<body><div><h2>Connecting OneDrive…</h2><p id="m">You can close this window if it does not close by itself.</p></div>
+<script>
+  // Hands the Microsoft sign in result back to the app window (same site), then closes.
+  try { localStorage.setItem('mkf_ms_auth', JSON.stringify({ search: location.search, t: Date.now() })); } catch (e) {}
+  if (window.opener) { setTimeout(function () { window.close(); }, 300); }
+  else { setTimeout(function () { location.replace('./#/data'); }, 800); }
+</script></body></html>

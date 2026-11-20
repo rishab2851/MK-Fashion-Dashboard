@@ -20,6 +20,7 @@ async function firebaseStore(cfg) {
   const db = F.getFirestore(app);
   let me = null;
   let unsubs = [];
+  let allUnsub = null;
   let billMaps = { fy: new Map(), open: new Map() };
 
   const stamp = () => ({ updatedAt: new Date().toISOString(), updatedBy: me?.email || '' });
@@ -52,7 +53,7 @@ async function firebaseStore(cfg) {
       await F.updateDoc(F.doc(db, 'users', me.email), { pinHash, lastSeen: new Date().toISOString() });
     },
     subscribe(fy, h, isAdmin) {
-      store.unsubscribe();
+      unsubs.forEach((u) => u()); unsubs = [];
       billMaps = { fy: new Map(), open: new Map() };
       const emitBills = () => {
         const m = new Map([...billMaps.open, ...billMaps.fy]);
@@ -71,9 +72,16 @@ async function firebaseStore(cfg) {
       }
       unsubs.push(F.onSnapshot(F.collection(db, 'vendors'), (snap) => h.vendors(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), err));
       unsubs.push(F.onSnapshot(F.doc(db, 'settings', 'app'), (s) => h.settings(s.exists() ? s.data() : {}), err));
+      unsubs.push(F.onSnapshot(F.doc(db, 'settings', 'sync'), (s) => h.sync && h.sync(s.exists() ? s.data() : {}), err));
       if (isAdmin) unsubs.push(F.onSnapshot(F.collection(db, 'users'), (snap) => h.users(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), err));
     },
-    unsubscribe() { unsubs.forEach((u) => u()); unsubs = []; },
+    unsubscribe() { unsubs.forEach((u) => u()); unsubs = []; allUnsub && allUnsub(); allUnsub = null; },
+    // Live list of every bill, used only on the device that syncs from OneDrive.
+    subscribeAllBills(cb) {
+      if (allUnsub) return;
+      allUnsub = F.onSnapshot(F.collection(db, 'bills'), (snap) => cb(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    },
+    async saveSync(o) { await F.setDoc(F.doc(db, 'settings', 'sync'), clean(o), { merge: true }); },
     async saveVendor(v) { await F.setDoc(F.doc(db, 'vendors', v.id), clean({ ...v, ...stamp() }), { merge: true }); },
     async deleteVendor(id) { await F.deleteDoc(F.doc(db, 'vendors', id)); },
     async saveBill(b) { await F.setDoc(F.doc(db, 'bills', b.id), clean({ ...b, ...stamp() })); },
@@ -120,6 +128,8 @@ function demoStore() {
     try { return JSON.parse(localStorage.getItem(KEY)) || null; } catch { return null; }
   };
   let db = load() || { vendors: {}, bills: {}, settings: {}, users: {}, logs: [] };
+  db.sync = db.sync || {};
+  let allCb = null;
   const me = { email: 'demo@local', name: 'Demo User', photo: '' };
   if (!db.users[me.email]) db.users[me.email] = { id: me.email, name: 'Demo User', role: 'admin', active: true };
   let h = null, fy = null;
@@ -133,6 +143,8 @@ function demoStore() {
     h.bills(bills);
     h.settings(db.settings || {});
     h.users && h.users(Object.values(db.users));
+    h.sync && h.sync({ ...db.sync });
+    allCb && allCb(Object.values(db.bills));
   };
   const async = (fn) => async (...a) => { const r = fn(...a); emit(); return r; };
   return {
@@ -143,6 +155,8 @@ function demoStore() {
     setOwnPin: async (pinHash) => { db.users[me.email].pinHash = pinHash; persist(); },
     subscribe(f, handlers) { fy = f; h = handlers; setTimeout(emit, 0); },
     unsubscribe() { h = null; },
+    subscribeAllBills(cb) { allCb = cb; setTimeout(emit, 0); },
+    saveSync: async((o) => { db.sync = { ...db.sync, ...o }; }),
     saveVendor: async((v) => { db.vendors[v.id] = { ...(db.vendors[v.id] || {}), ...v, ...stamp() }; }),
     deleteVendor: async((id) => { delete db.vendors[id]; }),
     saveBill: async((b) => { db.bills[b.id] = { ...b, ...stamp() }; }),
@@ -151,7 +165,7 @@ function demoStore() {
       for (const o of ops) {
         if (o.del) { delete db[o.col][o.id]; continue; }
         const base = o.merge ? db[o.col][o.id] || {} : {};
-        if (o.col === 'settings') db.settings = { ...db.settings, ...o.data };
+        if (o.col === 'settings') { db.settings = { ...db.settings, ...o.data }; continue; }
         else db[o.col][o.id] = { ...base, ...o.data, ...stamp() };
       }
       onProgress && onProgress(ops.length, ops.length);

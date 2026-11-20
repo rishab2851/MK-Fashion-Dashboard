@@ -1,10 +1,11 @@
-import { firebaseConfig, IDLE_LOCK_MINUTES } from './config.js';
+import { firebaseConfig, IDLE_LOCK_MINUTES, SYNC_CHECK_SECONDS } from './config.js';
+import * as od from './onedrive.js';
 import { createStore } from './store.js';
 import {
   DEPTS, DEPT_LABEL, STATUS, STATUS_ORDER, STATUS_CLASS, DEFAULT_SETTINGS, AGING,
   computeBill, summarize, interestIfPaidOn, todayStr, currentFY, fyOf, dayNum, addDays, billId, vendorIdOf, normName, uid,
 } from './calc.js';
-import { parseWorkbook, planImport, exportWorkbook } from './importer.js';
+import { parseWorkbook, planSync, removalOps, exportWorkbook } from './importer.js';
 import {
   esc, rs, rs2, nf, pct, dmy, daysText, $, $$, toast, openModal, closeModal, confirmBox, formData,
   downloadText, toCSV, sha256, columnChart, stackedBars,
@@ -25,6 +26,7 @@ const S = {
     ledger: { vendorId: '', from: '', to: '' },
   },
   ledgerCache: {},
+  sync: {}, allBills: null, syncBusy: false, syncErr: '', pending: [],
 };
 const role = () => S.profile?.role || 'viewer';
 const canEdit = () => ['admin', 'editor'].includes(role());
@@ -53,7 +55,7 @@ const NAV = [
   { grp: 'Tools' },
   { id: 'planner', label: 'Payment Planner', icon: 'cal' },
   { id: 'ledger', label: 'Vendor Ledger', icon: 'book' },
-  { id: 'data', label: 'Import and Export', icon: 'swap', need: 'edit' },
+  { id: 'data', label: 'Excel Sync', icon: 'swap', need: 'edit' },
   { id: 'settings', label: 'Settings and Users', icon: 'gear', need: 'admin' },
 ];
 const allowed = (n) => !n.need || (n.need === 'edit' ? canEdit() : isAdmin());
@@ -153,6 +155,7 @@ function enterApp() {
   startIdleWatch();
   subscribe();
   route();
+  startSync();
 }
 function subscribe() {
   S.store.subscribe(S.fy, {
@@ -160,6 +163,7 @@ function subscribe() {
     bills: (b) => { S.bills = b; changed(); },
     settings: (s) => { S.settings = { ...DEFAULT_SETTINGS, ...s }; changed(); },
     users: (u) => { S.users = u; changed(); },
+    sync: (x) => { const prev = S.sync.syncedAt; S.sync = x || {}; chip(); if (x && x.syncedAt && x.syncedAt !== prev) maybeShowSummary(); if (S.view === 'data') render(); },
     error: (e) => toast('Sync problem: ' + (e.code || e.message), 'err'),
   }, isAdmin());
 }
@@ -170,7 +174,7 @@ function changed() {
     const t = todayStr();
     S.rows = S.bills.map((bill) => ({ bill, c: computeBill(bill, S.settings, t) }));
     $('#side-company').textContent = S.settings.company || 'M K FASHION';
-    buildNav(); render();
+    buildNav(); render(); chip();
   }, 40);
 }
 function buildFY() {
@@ -255,7 +259,7 @@ VIEWS.dashboard = (el) => {
     <div class="dept-caption">${esc(caption)}</div>
     <div class="fine">${esc(fyNote())}</div>
   </div>
-  ${!S.bills.length ? `<div class="card pad empty">No bills yet. ${canEdit() ? '<a href="#/data">Import your Excel workbook</a> to load existing data.' : 'Ask an editor to import the data.'}</div>` : ''}
+  ${!S.bills.length ? `<div class="card pad empty">No bills yet. ${canEdit() ? '<a href="#/data">Set up Excel Sync</a> to load the data from your OneDrive workbook.' : 'The data appears here once the Excel sync is set up.'}</div>` : ''}
   <div class="kpis">
     <div class="kpi"><div class="lbl">Total invoiced</div><div class="val">${rs(kpi.inv)}</div><div class="sub">${kpi.count} ${DEPT_LABEL[d]} bills</div></div>
     <div class="kpi k-settled"><div class="lbl">Total settled</div><div class="val">${rs(kpi.settled)}</div><div class="sub">${isG ? 'Paid + debit notes' : 'Paid + TDS / DN'}</div></div>
@@ -302,7 +306,6 @@ function billList(dept) {
         <input type="search" class="grow" id="q" placeholder="Search vendor, invoice no or remarks" value="${esc(st.q)}">
         <select id="fv"><option value="">All vendors</option>${vendorsHere.map((v) => `<option ${v === st.vendor ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
         <select id="fs"><option value="due">Sort: due date</option><option value="inv">Sort: newest invoice</option><option value="bal">Sort: highest balance</option><option value="vendor">Sort: vendor</option></select>
-        ${canEdit() ? `<button class="btn primary" id="add">+ Add ${isG ? 'greige' : 'process house'} bill</button>` : ''}
       </div>
       <div class="chips" id="chips" style="margin-bottom:12px"></div>
       <div class="totals-bar" id="tot"></div>
@@ -338,16 +341,15 @@ function billList(dept) {
     $('#q', el).oninput = (e) => { st.q = e.target.value; draw(); };
     $('#fv', el).onchange = (e) => { st.vendor = e.target.value; draw(); };
     $('#fs', el).onchange = (e) => { st.sort = e.target.value; draw(); };
-    if ($('#add', el)) $('#add', el).onclick = () => billForm(null, dept);
     draw();
   };
 }
 VIEWS.greige = billList(DEPTS.GREIGE);
 VIEWS.process = billList(DEPTS.PROCESS);
 
-// ---------------------------------------------------------------- bill detail
+// ---------------------------------------------------------------- bill detail (read only: the Excel is the master)
 function openBill(id) {
-  const b = S.bills.find((x) => x.id === id) || (S.ledgerCache._all || []).find((x) => x.id === id);
+  const b = S.bills.find((x) => x.id === id) || (S.allBills || []).find((x) => x.id === id) || (S.ledgerCache._all || []).find((x) => x.id === id);
   if (!b) return toast('Bill not found', 'err');
   const c = computeBill(b, S.settings), isG = b.dept === DEPTS.GREIGE;
   const pays = [...(b.payments || [])].sort((x, y) => (x.date || '').localeCompare(y.date || ''));
@@ -356,132 +358,21 @@ function openBill(id) {
       <div>Invoice <b>${esc(b.invNo)}</b> dated <b>${dmy(b.invDate)}</b></div></div>${tag(c.status)}</div>
     <div class="kv">
       <div>Invoice amount<b>${rs2(c.inv)}</b></div><div>Credit terms<b>${esc(b.terms)} days</b></div><div>Due date<b>${dmy(c.due)}</b></div>
-      <div>Paid<b>${rs2(c.paid)}</b></div><div>${isG ? 'TDS / deductions' : 'TDS deducted'}<b>${rs2(c.tds)}</b></div><div>Debit note${b.dnNo ? ' (No. ' + esc(b.dnNo) + ')' : ''}<b>${rs2(c.dn)}</b></div>
+      <div>Paid<b>${rs2(c.paid)}</b></div>
+      ${isG ? `<div>Debit note${b.dnNo ? ' (No. ' + esc(b.dnNo) + ')' : ''}<b>${rs2(c.dn)}</b></div>` : `<div>TDS + DN<b>${rs2(c.dn + c.tds)}</b></div>`}
       <div>Balance<b class="${c.bal > 0 ? 'neg' : 'pos'}">${rs2(c.bal)}</b></div><div>Timing<b>${esc(daysText(c.days, c.open))}</b></div>
       ${isG ? `<div>Interest on late payments<b>${rs2(c.intPaid)}</b></div><div>Interest accrued on open balance<b>${rs2(c.intAccrued)}</b></div>` : ''}
     </div>
-    ${b.remarks ? `<p><b>Remarks:</b> ${esc(b.remarks)}</p>` : ''}
-    <div class="subhead"><span>Payments (${pays.length})</span>${canEdit() && c.bal > 0 ? '<button class="btn teal sm" id="addpay">+ Record payment</button>' : ''}</div>
-    <div id="payform"></div>
-    ${pays.length ? `<div class="tbl-wrap"><table class="t cards"><thead><tr><th>Date</th><th class="num">Amount</th><th class="num">TDS</th><th>Mode</th><th>Reference</th><th>Note</th>${canEdit() ? '<th></th>' : ''}</tr></thead><tbody>
-      ${pays.map((p) => `<tr>${td('Date', dmy(p.date), 'first')}${td('Amount', rs2(p.amount), 'num')}${td('TDS', rs2(p.tds), 'num')}${td('Mode', esc(p.mode || ''))}${td('Reference', esc(p.ref || ''))}${td('Note', esc(p.note || '') + (p.src === 'excel' ? ' <span class="cat">Excel</span>' : ''))}
-      ${canEdit() ? td('', `<button class="btn sm" data-edit="${esc(p.id)}">Edit</button> <button class="btn sm danger" data-del="${esc(p.id)}">Remove</button>`) : ''}</tr>`).join('')}</tbody></table></div>` : '<p class="muted">No payments recorded yet.</p>'}
-    <div class="form-actions">
-      ${isAdmin() ? '<button class="btn danger" id="delbill">Delete bill</button>' : ''}
-      ${canEdit() ? '<button class="btn" id="editbill">Edit bill details</button>' : ''}
-      <button class="btn primary" id="closeb">Close</button></div>
-    <p class="fine">Last updated ${b.updatedAt ? new Date(b.updatedAt).toLocaleString('en-IN') : ''} ${b.updatedBy ? 'by ' + esc(b.updatedBy) : ''}</p>`, { wide: true });
-  const el = m.el;
-  $('#closeb', el).onclick = m.close;
-  if ($('#editbill', el)) $('#editbill', el).onclick = () => billForm(b, b.dept);
-  if ($('#addpay', el)) $('#addpay', el).onclick = () => paymentForm(b, null, el);
-  $$('[data-edit]', el).forEach((x) => (x.onclick = () => paymentForm(b, (b.payments || []).find((p) => p.id === x.dataset.edit), el)));
-  $$('[data-del]', el).forEach((x) => (x.onclick = async () => {
-    if (!(await confirmBox('Remove payment?', 'This payment entry will be removed from the bill.', 'Remove', true))) return openBill(b.id);
-    const nb = { ...b, payments: (b.payments || []).filter((p) => p.id !== x.dataset.del) };
-    if (await guard(() => saveBill(nb), 'Payment removed')) { S.store.addLog('payment.remove', `${b.vendorName} inv ${b.invNo}`); openBill(b.id); }
-  }));
-  if ($('#delbill', el)) $('#delbill', el).onclick = async () => {
-    if (!(await confirmBox('Delete this bill?', `${esc(b.vendorName)} invoice ${esc(b.invNo)} and all its payments will be deleted permanently.`, 'Delete', true))) return openBill(b.id);
-    if (await guard(() => S.store.deleteBill(b.id), 'Bill deleted')) S.store.addLog('bill.delete', `${b.vendorName} inv ${b.invNo} ${rs(b.invAmt)}`);
-  };
-}
-async function saveBill(b) {
-  b.fy = fyOf(b.invDate);
-  b.open = computeBill(b, S.settings).open;
-  await S.store.saveBill(b);
-}
-function paymentForm(b, p, el) {
-  const c = computeBill(b, S.settings), isG = b.dept === DEPTS.GREIGE;
-  const box = $('#payform', el);
-  const def = p || { date: todayStr(), amount: Math.max(c.bal, 0), tds: 0, mode: 'NEFT', ref: '', note: '' };
-  box.innerHTML = `<form class="paybox" id="pf"><div class="form-grid">
-    <label class="f">Payment date<input type="date" name="date" required value="${def.date}"></label>
-    <label class="f">Amount paid (₹)<input type="number" step="0.01" min="0" name="amount" value="${def.amount}"></label>
-    <label class="f">TDS / deduction (₹)<input type="number" step="0.01" min="0" name="tds" value="${def.tds || 0}"></label>
-    <label class="f">Mode<select name="mode">${MODES.map((x) => `<option ${x === def.mode ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
-    <label class="f">UTR / cheque / reference<input type="text" name="ref" value="${esc(def.ref)}"></label>
-    <label class="f">Note<input type="text" name="note" value="${esc(def.note)}"></label></div>
-    ${isG ? '<div class="int-note" id="intnote"></div>' : ''}
-    ${p && p.src === 'excel' ? '<p class="warn-text">This entry came from the Excel import. A later Excel import will replace it with the Excel figure.</p>' : ''}
-    <div class="form-actions"><button type="button" class="btn ghost" id="pfx">Cancel</button><button class="btn teal">${p ? 'Save changes' : 'Save payment'}</button></div></form>`;
-  const f = $('#pf', box);
-  const upd = () => {
-    if (!isG) return;
-    const v = formData(f), due = dayNum(c.due), late = v.date ? dayNum(v.date) - due : 0;
-    const amt = Number(v.amount) || 0, k = S.settings.interestRate / (S.settings.daysInYear || 365);
-    $('#intnote', box).textContent = late > 0 ? `Paid ${late} days after due date. Interest at ${+(S.settings.interestRate * 100).toFixed(2)}% p.a. on this payment: ${rs2(amt * late * k)}` : 'Paid within the due date. No interest.';
-  };
-  f.oninput = upd; upd();
-  $('#pfx', box).onclick = () => (box.innerHTML = '');
-  f.onsubmit = async (e) => {
-    e.preventDefault();
-    const v = formData(f);
-    v.amount = Number(v.amount) || 0; v.tds = Number(v.tds) || 0;
-    if (v.amount + v.tds <= 0) return toast('Enter an amount', 'err');
-    const others = (b.payments || []).filter((x) => !p || x.id !== p.id);
-    const after = c.inv - c.dn - others.reduce((a, x) => a + (+x.amount || 0) + (+x.tds || 0), 0) - v.amount - v.tds;
-    if (after < -1 && !(await confirmBox('Payment exceeds balance', `This entry is ${rs2(-after)} more than the balance due. Save anyway?`, 'Save anyway'))) return openBill(b.id);
-    const entry = { ...(p || { id: uid(), src: 'app' }), ...v, by: S.user.email, at: new Date().toISOString() };
-    const nb = { ...b, payments: [...others, entry] };
-    if (await guard(() => saveBill(nb), p ? 'Payment updated' : 'Payment recorded')) {
-      S.store.addLog(p ? 'payment.edit' : 'payment.add', `${b.vendorName} inv ${b.invNo}: ${rs2(v.amount)} on ${dmy(v.date)}`);
-      openBill(b.id);
-    }
-  };
-}
-function vendorOptions(cat, selectedId) {
-  const list = S.vendors.filter((v) => v.active !== false || v.id === selectedId).sort((a, b) => a.name.localeCompare(b.name));
-  const mine = list.filter((v) => v.category === cat), rest = list.filter((v) => v.category !== cat);
-  const o = (v) => `<option value="${esc(v.id)}" ${v.id === selectedId ? 'selected' : ''}>${esc(v.name)}</option>`;
-  return `<option value="">Select vendor</option><optgroup label="${VCATS[cat]}">${mine.map(o).join('')}</optgroup>${rest.length ? `<optgroup label="Other vendors">${rest.map(o).join('')}</optgroup>` : ''}`;
-}
-function billForm(b, dept) {
-  const isG = dept === DEPTS.GREIGE, s = S.settings;
-  const def = b || { invDate: todayStr(), terms: isG ? s.greigeTerms : s.processTerms, invAmt: '', dnNo: '', dnAmt: '', remarks: '' };
-  const m = openModal(`<h3>${b ? 'Edit' : 'Add'} ${DEPT_LABEL[dept].toLowerCase()} bill</h3>
-    <form id="bf"><div class="form-grid">
-      <label class="f span2">Vendor<select name="vendorId" required>${vendorOptions(dept, b?.vendorId)}</select>
-        <span class="hint">Not in the list? Add the vendor in Vendor Master List first.</span></label>
-      <label class="f">Invoice no<input type="text" name="invNo" required value="${esc(def.invNo || '')}"></label>
-      <label class="f">Invoice date<input type="date" name="invDate" required value="${def.invDate}"></label>
-      <label class="f">Credit terms (days)<input type="number" name="terms" min="0" required value="${def.terms}"></label>
-      <label class="f">Invoice amount (₹)<input type="number" step="0.01" min="0" name="invAmt" required value="${def.invAmt}"></label>
-      <label class="f">Debit note no<input type="text" name="dnNo" value="${esc(def.dnNo || '')}"></label>
-      <label class="f">Debit note amount (₹)<input type="number" step="0.01" min="0" name="dnAmt" value="${def.dnAmt || ''}"></label>
-      <label class="f full">Remarks<input type="text" name="remarks" value="${esc(def.remarks || '')}"></label>
-    </div><p class="fine" id="duenote"></p>
-    <div class="form-actions"><button type="button" class="btn ghost" id="bfx">Cancel</button><button class="btn primary">${b ? 'Save changes' : 'Add bill'}</button></div></form>`);
-  const f = $('#bf', m.el);
-  let termsTouched = !!b;
-  f.terms.oninput = () => (termsTouched = true);
-  f.vendorId.onchange = () => { const v = vendorById(f.vendorId.value); if (v && v.terms !== '' && v.terms != null && !termsTouched) f.terms.value = v.terms; upd(); };
-  const upd = () => { if (f.invDate.value) $('#duenote', m.el).textContent = `Due date: ${dmy(addDays(f.invDate.value, f.terms.value || 0))}`; };
-  f.oninput = upd; upd();
-  $('#bfx', m.el).onclick = () => (b ? openBill(b.id) : m.close());
-  f.onsubmit = async (e) => {
-    e.preventDefault();
-    const v = formData(f);
-    const vend = vendorById(v.vendorId);
-    if (!vend) return toast('Select a vendor', 'err');
-    const data = { vendorId: vend.id, vendorName: vend.name, invNo: v.invNo, invDate: v.invDate, terms: Number(v.terms), invAmt: Number(v.invAmt), dnNo: v.dnNo, dnAmt: Number(v.dnAmt) || 0, remarks: v.remarks };
-    let nb;
-    if (b) nb = { ...b, ...data };
-    else {
-      const id = billId(dept, vend.name, fyOf(v.invDate), v.invNo);
-      let existing = [];
-      try { existing = await S.store.fetchVendorBills(vend.id); } catch { existing = S.bills; }
-      if (existing.some((x) => x.id === id)) return toast(`Invoice ${v.invNo} of ${vend.name} already exists for FY ${fyOf(v.invDate)}`, 'err');
-      nb = { id, dept, ...data, payments: [], createdAt: new Date().toISOString(), createdBy: S.user.email };
-    }
-    if (await guard(() => saveBill(nb), b ? 'Bill updated' : 'Bill added')) {
-      S.store.addLog(b ? 'bill.edit' : 'bill.add', `${vend.name} inv ${v.invNo} ${rs(data.invAmt)}`);
-      openBill(nb.id);
-    }
-  };
+    <div class="subhead"><span>Payments (${pays.length})</span></div>
+    ${pays.length ? `<div class="tbl-wrap"><table class="t cards"><thead><tr><th>Date</th><th class="num">Amount</th><th>Mode</th><th>Reference</th><th>Remarks</th><th>Excel row</th></tr></thead><tbody>
+      ${pays.map((p) => `<tr>${td('Date', p.date ? dmy(p.date) : '<span class="neg">No date</span>', 'first')}${td('Amount', rs2(p.amount), 'num')}${td('Mode', esc(p.mode || ''))}${td('Reference', esc(p.ref || ''))}${td('Remarks', esc(p.note || ''))}${td('Excel row', p.src === 'excel' ? esc(p.row || '') : '<span class="cat">Recorded in app</span>')}</tr>`).join('')}</tbody></table></div>` : '<p class="muted">No payments yet.</p>'}
+    <div class="notice" style="margin-top:14px">This bill comes from the Excel${b.srcRow ? `, <b>${esc(b.srcRow)}</b>` : ''}. To change the bill or its payments, edit the Excel file. The app picks up the change automatically.</div>
+    <div class="form-actions"><button class="btn primary" id="closeb">Close</button></div>
+    <p class="fine">Last synced ${b.updatedAt ? new Date(b.updatedAt).toLocaleString('en-IN') : ''}</p>`, { wide: true });
+  $('#closeb', m.el).onclick = m.close;
 }
 
-// ---------------------------------------------------------------- vendors
+// ---------------------------------------------------------------- vendors (names and categories come from Excel, details are kept in the app)
 VIEWS.vendors = (el) => {
   const st = S.ui.vendors;
   const openBy = new Map();
@@ -493,9 +384,9 @@ VIEWS.vendors = (el) => {
   const counts = { ALL: S.vendors.length };
   for (const k of Object.keys(VCATS)) counts[k] = S.vendors.filter((v) => v.category === k).length;
   el.innerHTML = `
-    <div class="toolbar"><input type="search" class="grow" id="vq" placeholder="Search name, city, GSTIN, phone" value="${esc(st.q)}">
-      ${canEdit() ? '<button class="btn primary" id="addv">+ Add vendor</button>' : ''}</div>
-    <div class="chips" style="margin-bottom:14px">${[['ALL', 'All'], ...Object.entries(VCATS)].map(([k, l]) => `<button class="chip ${st.cat === k ? 'on' : ''}" data-c="${k}">${l}<b>${counts[k] || 0}</b></button>`).join('')}</div>
+    <div class="toolbar"><input type="search" class="grow" id="vq" placeholder="Search name, city, GSTIN, phone" value="${esc(st.q)}"></div>
+    <div class="chips" style="margin-bottom:10px">${[['ALL', 'All'], ...Object.entries(VCATS)].map(([k, l]) => `<button class="chip ${st.cat === k ? 'on' : ''}" data-c="${k}">${l}<b>${counts[k] || 0}</b></button>`).join('')}</div>
+    <p class="fine" style="margin:0 0 12px">New vendors are added in the Excel VENDOR MASTER sheet and appear here after the next sync. Contact, GST and bank details are entered here.</p>
     <div class="vgrid" id="vg"></div>`;
   const draw = () => {
     const q = st.q.toLowerCase();
@@ -508,13 +399,13 @@ VIEWS.vendors = (el) => {
         <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start"><span class="nm">${esc(v.name)}</span><span class="cat ${esc(v.category)}">${esc(VCATS[v.category] || v.category)}</span></div>
         <div class="meta">${[v.contact, v.phone, v.city].filter(Boolean).map(esc).join(' · ') || 'No contact details yet'}</div>
         ${v.gstin ? `<div class="meta">GSTIN ${esc(v.gstin)}</div>` : ''}
+        ${v.active === false ? `<div class="meta warn-text">Inactive: ${esc(v.inactiveReason || '')}</div>` : ''}
         <div class="bal"><span>${o ? o.n + ' bills' : 'No bills in view'}</span><b class="${o && o.urgent ? 'neg' : ''}">${o ? rs(o.bal) + ' due' : ''}</b></div></div>`;
     }).join('') || '<div class="empty">No vendors found.</div>';
     $$('.vcard', el).forEach((c) => (c.onclick = () => openVendor(c.dataset.id)));
   };
   $('#vq', el).oninput = (e) => { st.q = e.target.value; draw(); };
   $$('.chip', el).forEach((b) => (b.onclick = () => { st.cat = b.dataset.c; render(); }));
-  if ($('#addv', el)) $('#addv', el).onclick = () => vendorForm(null);
   draw();
 };
 const VFIELDS = [
@@ -527,50 +418,34 @@ function openVendor(id) {
   const rows = S.rows.filter((r) => r.bill.vendorId === id);
   const bal = rows.reduce((a, r) => a + r.c.bal, 0);
   const m = openModal(`<div class="detail-head"><div><span class="cat ${esc(v.category)}">${esc(VCATS[v.category] || v.category)}</span><h2 style="margin:6px 0 0">${esc(v.name)}</h2>
-     ${v.active === false ? '<span class="tag st-pending">INACTIVE</span>' : ''}</div></div>
+     ${v.active === false ? `<span class="tag st-pending">INACTIVE: ${esc(v.inactiveReason || '')}</span>` : ''}</div></div>
     <div class="kv">${VFIELDS.map(([k, l]) => `<div>${l}<b>${esc(v[k] ?? '') || '<span class="muted">Not entered</span>'}</b></div>`).join('')}
       <div>Bills in view<b>${rows.length}</b></div><div>Open balance<b>${rs(bal)}</b></div></div>
-    <div class="form-actions">${isAdmin() ? '<button class="btn danger" id="delv">Delete</button>' : ''}<button class="btn" id="ledv">View ledger</button>
+    <div class="form-actions"><button class="btn" id="ledv">View ledger</button>
       ${canEdit() ? '<button class="btn primary" id="editv">Edit details</button>' : ''}</div>`, { wide: true });
   $('#ledv', m.el).onclick = () => { m.close(); location.hash = '#/ledger/' + encodeURIComponent(id); };
   if ($('#editv', m.el)) $('#editv', m.el).onclick = () => vendorForm(v);
-  if ($('#delv', m.el)) $('#delv', m.el).onclick = async () => {
-    const all = await S.store.fetchVendorBills(id).catch(() => rows);
-    if (all.length) return toast(`This vendor has ${all.length} bills. Mark the vendor inactive instead.`, 'err');
-    if (!(await confirmBox('Delete vendor?', `${esc(v.name)} will be removed from the master list.`, 'Delete', true))) return openVendor(id);
-    if (await guard(() => S.store.deleteVendor(id), 'Vendor deleted')) S.store.addLog('vendor.delete', v.name);
-  };
 }
 function vendorForm(v) {
-  const d = v || { category: S.ui.vendors.cat !== 'ALL' ? S.ui.vendors.cat : 'GREIGE', active: true };
-  const m = openModal(`<h3>${v ? 'Edit vendor' : 'Add vendor'}</h3><form id="vf"><div class="form-grid">
-    <label class="f span2">Vendor name<input type="text" name="name" required value="${esc(d.name || '')}"></label>
-    <label class="f">Category<select name="category">${Object.entries(VCATS).map(([k, l]) => `<option value="${k}" ${d.category === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    ${VFIELDS.map(([k, l]) => `<label class="f ${k === 'address' || k === 'notes' ? 'span2' : ''}">${l}<input type="${k === 'terms' ? 'number' : k === 'email' ? 'email' : 'text'}" name="${k}" value="${esc(d[k] ?? '')}" ${k === 'gstin' || k === 'pan' || k === 'ifsc' ? 'style="text-transform:uppercase"' : ''}></label>`).join('')}
-    <label class="f chk"><input type="checkbox" name="active" ${d.active !== false ? 'checked' : ''}> Active</label>
+  const m = openModal(`<h3>Vendor details</h3><p><b>${esc(v.name)}</b> <span class="cat ${esc(v.category)}">${esc(VCATS[v.category] || v.category)}</span></p>
+    <p class="fine">The name and category come from the Excel VENDOR MASTER. Change them there.</p>
+    <form id="vf"><div class="form-grid">
+    ${VFIELDS.map(([k, l]) => `<label class="f ${k === 'address' || k === 'notes' ? 'span2' : ''}">${l}<input type="${k === 'terms' ? 'number' : k === 'email' ? 'email' : 'text'}" name="${k}" value="${esc(v[k] ?? '')}" ${k === 'gstin' || k === 'pan' || k === 'ifsc' ? 'style="text-transform:uppercase"' : ''}></label>`).join('')}
     </div><p class="warn-text" id="vwarn"></p>
-    <div class="form-actions"><button type="button" class="btn ghost" id="vfx">Cancel</button><button class="btn primary">${v ? 'Save changes' : 'Add vendor'}</button></div></form>`, { wide: true });
+    <div class="form-actions"><button type="button" class="btn ghost" id="vfx">Cancel</button><button class="btn primary">Save details</button></div></form>`, { wide: true });
   const f = $('#vf', m.el);
-  $('#vfx', m.el).onclick = () => (v ? openVendor(v.id) : m.close());
+  $('#vfx', m.el).onclick = () => openVendor(v.id);
   f.onsubmit = async (e) => {
     e.preventDefault();
     const x = formData(f);
-    x.name = normName(x.name); x.gstin = x.gstin.toUpperCase(); x.pan = x.pan.toUpperCase(); x.ifsc = x.ifsc.toUpperCase();
+    x.gstin = x.gstin.toUpperCase(); x.pan = x.pan.toUpperCase(); x.ifsc = x.ifsc.toUpperCase();
     const warn = [];
     if (x.gstin && !/^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(x.gstin)) warn.push('GSTIN format looks wrong.');
     if (x.pan && !/^[A-Z]{5}\d{4}[A-Z]$/.test(x.pan)) warn.push('PAN format looks wrong.');
     if (x.ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(x.ifsc)) warn.push('IFSC format looks wrong.');
-    if (warn.length && $('#vwarn', m.el).textContent !== warn.join(' ') + ' Press save again to keep it.') { $('#vwarn', m.el).textContent = warn.join(' ') + ' Press save again to keep it.'; return; }
-    const id = v ? v.id : vendorIdOf(x.name);
-    if (!v && vendorById(id)) return toast('A vendor with this name already exists', 'err');
-    const ok = await guard(async () => {
-      await S.store.saveVendor({ ...(v || {}), ...x, id });
-      if (v && v.name !== x.name) {
-        const bills = await S.store.fetchVendorBills(id);
-        await S.store.writeMany(bills.map((b) => ({ col: 'bills', id: b.id, data: { vendorName: x.name }, merge: true })));
-      }
-    }, v ? 'Vendor updated' : 'Vendor added');
-    if (ok) { S.store.addLog(v ? 'vendor.edit' : 'vendor.add', x.name); setTimeout(() => openVendor(id), 120); }
+    const msg = warn.join(' ') + ' Press save again to keep it.';
+    if (warn.length && $('#vwarn', m.el).textContent !== msg) { $('#vwarn', m.el).textContent = msg; return; }
+    if (await guard(() => S.store.saveVendor({ id: v.id, ...x }), 'Vendor details saved')) { S.store.addLog('vendor.edit', v.name); setTimeout(() => openVendor(v.id), 120); }
   };
 }
 
@@ -606,11 +481,11 @@ VIEWS.planner = (el) => {
     const sb = sel.reduce((a, r) => a + r.c.bal, 0), si = sel.reduce((a, r) => a + r.int, 0);
     const ab = shown.reduce((a, r) => a + r.c.bal, 0);
     $('#psum', el).innerHTML = `<div>Shown<b>${shown.length} bills · ${rs(ab)}</b></div><div>Selected<b>${sel.length} bills</b></div><div>Balance<b>${rs(sb)}</b></div><div>Interest<b>${rs(si)}</b></div><div>Cash needed<b>${rs(sb + si)}</b></div>
-      <div class="acts"><button class="btn" id="pvs" ${sel.length ? '' : 'disabled'}>Vendor summary</button><button class="btn" id="pcsv" ${sel.length ? '' : 'disabled'}>Export CSV</button><button class="btn" id="pprint" ${sel.length ? '' : 'disabled'}>Print</button>${canEdit() ? `<button class="btn primary" id="ppay" ${sel.length ? '' : 'disabled'}>Mark as paid</button>` : ''}</div>`;
+      <div class="acts"><button class="btn" id="pvs" ${sel.length ? '' : 'disabled'}>Vendor summary</button><button class="btn" id="pcsv" ${sel.length ? '' : 'disabled'}>Export CSV</button><button class="btn" id="pprint" ${sel.length ? '' : 'disabled'}>Print</button></div>`;
     $$('#pl input[data-id]', el).forEach((c) => (c.onchange = () => { c.checked ? st.sel.add(c.dataset.id) : st.sel.delete(c.dataset.id); draw(); }));
     if ($('#pall', el)) $('#pall', el).onchange = (e) => { shown.forEach((r) => (e.target.checked ? st.sel.add(r.bill.id) : st.sel.delete(r.bill.id))); draw(); };
     const bind = (id, fn) => { const b = $('#' + id, el); if (b) b.onclick = () => fn(sel); };
-    bind('pvs', vendorSummary); bind('pcsv', planCSV); bind('pprint', planPrint); bind('ppay', markPaid);
+    bind('pvs', vendorSummary); bind('pcsv', planCSV); bind('pprint', planPrint);
   };
   $('#pd', el).onchange = (e) => { st.dept = e.target.value; draw(); };
   $('#pw', el).onchange = (e) => { st.win = e.target.value; draw(); };
@@ -642,28 +517,6 @@ function planCSV(sel) {
   downloadText(`Payment_plan_${S.ui.plan.date}.csv`, toCSV(rows));
 }
 function planPrint() { const t = $('#ptab'); t && t.classList.add('print-sel'); window.print(); setTimeout(() => t && t.classList.remove('print-sel'), 500); }
-async function markPaid(sel) {
-  const m = openModal(`<h3>Mark ${sel.length} bills as paid</h3>
-    <p class="muted">The full balance of each selected bill will be recorded as paid on <b>${dmy(S.ui.plan.date)}</b>. For payments with TDS or part payments, record them one by one from the bill instead.</p>
-    <form id="mp"><div class="form-grid"><label class="f">Mode<select name="mode">${MODES.map((x) => `<option>${x}</option>`).join('')}</select></label>
-    <label class="f">Reference (UTR / batch no)<input type="text" name="ref"></label></div>
-    <div class="form-actions"><button type="button" class="btn ghost" id="mpx">Cancel</button><button class="btn primary">Record ${sel.length} payments</button></div></form>`);
-  $('#mpx', m.el).onclick = m.close;
-  $('#mp', m.el).onsubmit = async (e) => {
-    e.preventDefault();
-    const v = formData(e.target);
-    const ops = sel.map((r) => {
-      const nb = { ...r.bill, payments: [...(r.bill.payments || []), { id: uid(), src: 'app', date: S.ui.plan.date, amount: r.c.bal, tds: 0, mode: v.mode, ref: v.ref, note: 'Payment planner', by: S.user.email, at: new Date().toISOString() }] };
-      nb.fy = fyOf(nb.invDate); nb.open = computeBill(nb, S.settings).open;
-      return { col: 'bills', id: nb.id, data: nb };
-    });
-    if (await guard(() => S.store.writeMany(ops), `${ops.length} payments recorded`)) {
-      S.store.addLog('planner.pay', `${ops.length} bills, ${rs(sel.reduce((a, r) => a + r.c.bal, 0))}, ref ${v.ref}`);
-      S.ui.plan.sel.clear(); m.close();
-    }
-  };
-}
-
 // ---------------------------------------------------------------- vendor ledger
 VIEWS.ledger = (el) => {
   const st = S.ui.ledger;
@@ -699,7 +552,7 @@ VIEWS.ledger = (el) => {
     const ev = [];
     for (const b of all) {
       ev.push({ date: b.invDate, o: 0, text: `${DEPT_LABEL[b.dept]} bill, inv ${b.invNo}`, cr: +b.invAmt || 0, dr: 0, id: b.id });
-      if (+b.dnAmt) ev.push({ date: b.invDate, o: 1, text: `Debit note${b.dnNo ? ' ' + b.dnNo : ''} against inv ${b.invNo}`, cr: 0, dr: +b.dnAmt, id: b.id });
+      if (+b.dnAmt) ev.push({ date: b.invDate, o: 1, text: `${b.dept === DEPTS.PROCESS ? 'TDS + DN' : 'Debit note' + (b.dnNo ? ' ' + b.dnNo : '')} against inv ${b.invNo}`, cr: 0, dr: +b.dnAmt, id: b.id });
       for (const p of b.payments || []) {
         if (+p.amount) ev.push({ date: p.date, o: 2, text: `Payment${p.mode ? ' by ' + p.mode : ''}${p.ref ? ', ref ' + p.ref : ''} against inv ${b.invNo}`, cr: 0, dr: +p.amount, id: b.id });
         if (+p.tds) ev.push({ date: p.date, o: 3, text: `TDS deducted against inv ${b.invNo}`, cr: 0, dr: +p.tds, id: b.id });
@@ -733,60 +586,93 @@ VIEWS.ledger = (el) => {
   load();
 };
 
-// ---------------------------------------------------------------- import / export
+// ---------------------------------------------------------------- Excel sync page
 VIEWS.data = (el) => {
+  const st = od.status(), x = S.sync || {};
+  const cfg = od.configured();
+  const hrs = st.rtExp ? Math.max(0, Math.round((st.rtExp - Date.now()) / 3600000)) : 0;
   el.innerHTML = `
-    <div class="card"><div class="sec-title">IMPORT FROM EXCEL</div><div class="pad">
-      <p>Choose your payables workbook (.xlsx). The app reads the <b>GREIGE</b>, <b>PROCESS HOUSE</b> and <b>VENDOR MASTER</b> (or SETUP) sheets.</p>
-      <div class="notice"><b>How re-importing works</b><ul>
-        <li>Each bill is matched on department, vendor, invoice number and financial year, so importing the same file again updates bills instead of duplicating them.</li>
-        <li>The Excel AMT PAID becomes one payment entry marked "Excel". On a later import that entry is replaced by the new Excel figure. Payments recorded in the app are never touched.</li>
-        <li>Once the team starts recording payments in the app, stop entering them in Excel, otherwise they will be counted twice. The preview warns you if it finds this.</li>
-        <li>Existing vendor details are never overwritten. New vendor names are added to the master.</li></ul></div>
-      <p><input type="file" id="xf" accept=".xlsx,.xlsm,.xls"></p><div id="xprev"></div></div></div>
-    <div class="card"><div class="sec-title">EXPORT AND BACKUP</div><div class="pad">
-      <p>Download everything (all years) as an Excel workbook with GREIGE, PROCESS HOUSE, PAYMENTS and VENDOR MASTER sheets.</p>
+    <div class="card"><div class="sec-title">1. ONEDRIVE CONNECTION <small>on this device</small></div><div class="pad">
+      ${!cfg ? `<div class="notice warn"><b>Microsoft app id not set yet.</b> Follow Part B of the setup guide, then paste the Application (client) ID into <code>js/config.js</code>.
+        When registering, use this redirect address:<br><code id="ruri">${esc(od.redirectUri())}</code> <button class="btn sm" id="copyr">Copy</button></div>`
+      : st.connected ? `<p>Connected as <b>${esc(st.account?.name || '')}</b> ${esc(st.account?.email || '')}. Microsoft sign in valid for about ${hrs} more hours on this device.</p>`
+      : st.expired ? `<div class="notice warn">The OneDrive sign in on this device has expired (Microsoft limits it to 24 hours). Tap Reconnect, it usually completes by itself.</div>`
+      : `<p>This device is not connected to OneDrive. Connect it on the device you use most, for example your phone and your laptop.</p>`}
+      ${cfg ? `<div class="form-actions" style="justify-content:flex-start">
+        ${st.connected ? '<button class="btn" id="odout">Disconnect this device</button>' : `<button class="btn primary" id="odin">${st.expired ? 'Reconnect OneDrive' : 'Connect OneDrive'}</button>`}</div>` : ''}
+    </div></div>
+
+    <div class="card"><div class="sec-title">2. EXCEL WORKBOOK</div><div class="pad">
+      ${x.itemId ? `<div class="kv"><div>File<b>${esc(x.fileName || '')}</b></div><div>Folder<b>${esc(x.path || '/')}</b></div>
+        <div>Last saved in OneDrive<b>${x.fileModified ? new Date(x.fileModified).toLocaleString('en-IN') : ''}</b></div>
+        <div>Last synced<b>${x.syncedAt ? new Date(x.syncedAt).toLocaleString('en-IN') : 'Not yet'}</b></div><div>Synced by<b>${esc(x.by || '')}</b></div>
+        <div>Checks every<b>${SYNC_CHECK_SECONDS} seconds while open</b></div></div>`
+        : '<p class="muted">No workbook chosen yet.</p>'}
+      <div class="form-actions" style="justify-content:flex-start">
+        ${isAdmin() && st.connected ? `<button class="btn" id="pick">${x.itemId ? 'Change workbook' : 'Choose workbook'}</button>` : ''}
+        ${x.itemId && st.connected ? `<button class="btn teal" id="syncnow" ${S.syncBusy ? 'disabled' : ''}>${S.syncBusy ? 'Syncing…' : 'Sync now'}</button>` : ''}
+        ${S.pending.length ? `<button class="btn danger" id="review">Review ${S.pending.length} removals</button>` : ''}</div>
+      ${S.syncErr ? `<div class="notice warn" style="margin-top:10px">${esc(S.syncErr)}</div>` : ''}
+      ${(x.lines || []).length ? `<div class="subhead"><span>Changes in the last sync</span></div><ul class="chg">${x.lines.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>` : ''}
+      ${(x.warnings || []).length ? `<div class="notice warn" style="margin-top:10px"><b>${x.warnings.length} points to check in the Excel</b><ul>${x.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
+    </div></div>
+
+    <div class="card"><div class="sec-title">3. SYNC FROM A FILE ON THIS DEVICE <small>fallback, same rules as OneDrive</small></div><div class="pad">
+      <p class="fine">Use this only if OneDrive is not available. Choose the same workbook.</p>
+      <input type="file" id="xf" accept=".xlsx,.xlsm"></div></div>
+
+    <div class="card"><div class="sec-title">4. EXPORT AND BACKUP</div><div class="pad">
       <div class="form-actions" style="justify-content:flex-start"><button class="btn teal" id="xexp">Export to Excel</button>
-      ${isAdmin() ? '<button class="btn" id="jexp">Download full backup (JSON)</button><label class="btn">Restore backup<input type="file" id="jimp" accept=".json" hidden></label>' : ''}
-      ${S.store.mode === 'demo' ? '<button class="btn danger" id="dreset">Clear demo data</button>' : ''}</div></div></div>`;
-  $('#xf', el).onchange = async (e) => {
-    const file = e.target.files[0]; if (!file) return;
-    const box = $('#xprev', el);
-    box.innerHTML = '<p class="muted">Reading the workbook…</p>';
-    try {
-      const parsed = await parseWorkbook(await file.arrayBuffer());
-      if (parsed.exported) { box.innerHTML = '<div class="notice warn">This file was exported from the app. Importing it back would count app payments twice, so it has been blocked. Import your working Excel file instead.</div>'; return; }
-      const existing = await S.store.fetchAllBills();
-      const { ops, sum } = planImport(parsed, existing, S.vendors, S.settings);
-      const warn = [...parsed.warnings, ...sum.conflicts];
-      box.innerHTML = `<h3>Preview of ${esc(file.name)}</h3><p class="fine">${parsed.sheets.map(esc).join(' · ')}</p>
-        <div class="stat-grid"><div>New bills<b>${sum.billsNew}</b></div><div>Bills updated<b>${sum.billsUpdated}</b></div><div>Unchanged<b>${sum.billsSame}</b></div><div>New vendors<b>${sum.vendorsNew}</b></div></div>
-        ${Object.keys(sum.params).length ? `<p class="fine">Parameters found and applied: ${Object.entries(sum.params).map(([k, v]) => `${k} = ${v}`).join(', ')}</p>` : ''}
-        ${sum.vendorsFromBills.length ? `<div class="notice warn" style="margin-bottom:10px"><b>${sum.vendorsFromBills.length} vendor names appear in bills but not in the master.</b> They will be added: ${sum.vendorsFromBills.map(esc).join(', ')}</div>` : ''}
-        ${warn.length ? `<div class="notice warn"><b>${warn.length} points to check</b><ul>${warn.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
-        <div class="form-actions" style="justify-content:flex-start"><button class="btn primary" id="xgo" ${ops.length ? '' : 'disabled'}>${ops.length ? `Import now (${ops.length} changes)` : 'Nothing to import'}</button></div><p id="xprog" class="fine"></p>`;
-      if (ops.length) $('#xgo', box).onclick = async (ev) => {
-        ev.target.disabled = true;
-        const ok = await guard(() => S.store.writeMany(ops, (d, t) => ($('#xprog', box).textContent = `Saved ${d} of ${t}…`)), 'Import complete');
-        if (ok) { S.ledgerCache = {}; S.store.addLog('import.excel', `${file.name}: ${sum.billsNew} new, ${sum.billsUpdated} updated, ${sum.vendorsNew} vendors`); $('#xprog', box).textContent = 'Import complete. Open the dashboard to review.'; }
-      };
-    } catch (er) { console.error(er); box.innerHTML = `<div class="notice warn">Could not read this file: ${esc(er.message)}</div>`; }
-  };
-  $('#xexp', el).onclick = async () => guard(async () => exportWorkbook(await S.store.fetchAllBills(), S.vendors, S.settings), 'Export downloaded');
-  if ($('#jexp', el)) $('#jexp', el).onclick = async () => guard(async () => {
+      ${isAdmin() ? '<button class="btn" id="jexp">Download full backup (JSON)</button>' : ''}
+      ${S.store.mode === 'demo' ? '<button class="btn danger" id="dreset">Clear demo data</button>' : ''}</div>
+      <p class="fine">The export includes vendor details entered in the app. Keep it private.</p></div></div>`;
+  const on = (id, fn) => { const b = $('#' + id, el); if (b) b.onclick = fn; };
+  on('copyr', () => { navigator.clipboard?.writeText(od.redirectUri()); toast('Copied'); });
+  on('odin', async () => {
+    try { const a = await od.connect({ chooseAccount: !st.expired }); if (a !== null) { toast('OneDrive connected'); S.syncErr = ''; render(); chip(); if (S.sync.itemId) runSync({ force: true }); } }
+    catch (e) { toast(e.message, 'err'); }
+  });
+  on('odout', () => { od.disconnect(); toast('Disconnected on this device'); render(); chip(); });
+  on('pick', pickWorkbook);
+  on('syncnow', () => runSync({ force: true, announce: true }));
+  on('review', () => reviewPending());
+  on('xexp', async () => guard(async () => exportWorkbook(await S.store.fetchAllBills(), S.vendors, S.settings), 'Export downloaded'));
+  on('jexp', async () => guard(async () => {
     const data = { app: 'mkf-payables', exportedAt: new Date().toISOString(), settings: S.settings, vendors: S.vendors, bills: await S.store.fetchAllBills() };
     downloadText(`MKF_backup_${todayStr()}.json`, JSON.stringify(data, null, 1), 'application/json');
-  }, 'Backup downloaded');
-  if ($('#jimp', el)) $('#jimp', el).onchange = async (e) => {
+  }, 'Backup downloaded'));
+  on('dreset', async () => { if (await confirmBox('Clear demo data?', 'All demo data in this browser will be removed.', 'Clear', true)) S.store.resetDemo(); });
+  $('#xf', el).onchange = async (e) => {
     const f = e.target.files[0]; if (!f) return;
-    let data; try { data = JSON.parse(await f.text()); } catch { return toast('Not a valid backup file', 'err'); }
-    if (data.app !== 'mkf-payables') return toast('Not a backup from this app', 'err');
-    if (!(await confirmBox('Restore backup?', `This writes ${data.vendors.length} vendors and ${data.bills.length} bills from ${esc(data.exportedAt)}. Records with the same id are replaced. Nothing else is deleted.`, 'Restore', true))) return;
-    const ops = [...data.vendors.map((v) => ({ col: 'vendors', id: v.id, data: v })), ...data.bills.map((b) => ({ col: 'bills', id: b.id, data: b }))];
-    if (await guard(() => S.store.writeMany(ops), 'Backup restored')) S.store.addLog('backup.restore', f.name);
+    runSync({ manual: { buf: await f.arrayBuffer(), name: f.name }, announce: true });
+    e.target.value = '';
   };
-  if ($('#dreset', el)) $('#dreset', el).onclick = async () => { if (await confirmBox('Clear demo data?', 'All demo data in this browser will be removed.', 'Clear', true)) S.store.resetDemo(); };
 };
+
+async function pickWorkbook() {
+  const m = openModal(`<h3>Choose the workbook in OneDrive</h3>
+    <div class="toolbar"><input type="search" class="grow" id="wq" placeholder="Part of the file name" value="Vendor"><button class="btn" id="wgo">Search</button></div>
+    <div id="wl"><p class="muted">Searching…</p></div>`, { wide: true });
+  const go = async () => {
+    $('#wl', m.el).innerHTML = '<p class="muted">Searching…</p>';
+    try {
+      const list = await od.findWorkbooks($('#wq', m.el).value.trim() || 'xlsx');
+      $('#wl', m.el).innerHTML = list.length ? `<div class="tbl-wrap"><table class="t cards"><tbody>${list.map((f, i) => `<tr class="click" data-i="${i}">${td('File', `<span class="vname">${esc(f.name)}</span>`, 'first')}${td('Folder', esc(f.path))}${td('Saved', new Date(f.modified).toLocaleString('en-IN'))}</tr>`).join('')}</tbody></table></div>`
+        : '<p class="muted">No Excel files found. Try another part of the name, or "xlsx".</p>';
+      $$('#wl tr[data-i]', m.el).forEach((tr) => (tr.onclick = async () => {
+        const f = list[+tr.dataset.i];
+        if (!(await confirmBox('Use this workbook?', `<b>${esc(f.name)}</b> in ${esc(f.path)}. The app will show exactly what this file contains.`, 'Use it'))) return;
+        if (await guard(() => S.store.saveSync({ driveId: f.driveId, itemId: f.itemId, fileName: f.name, path: f.path, cTag: '', lines: [], warnings: [] }), 'Workbook selected')) {
+          S.store.addLog('sync.file', f.name);
+          S.sync = { ...S.sync, driveId: f.driveId, itemId: f.itemId, fileName: f.name, path: f.path, cTag: '' };
+          runSync({ force: true, announce: true });
+        }
+      }));
+    } catch (e) { $('#wl', m.el).innerHTML = `<div class="notice warn">${esc(e.message)}</div>`; }
+  };
+  $('#wgo', m.el).onclick = go; $('#wq', m.el).onkeydown = (e) => { if (e.key === 'Enter') go(); };
+  go();
+}
 
 // ---------------------------------------------------------------- settings & users
 VIEWS.settings = (el) => {
@@ -861,6 +747,146 @@ function changePin() {
     const h = await pinHash(v.n1);
     if (await guard(() => S.store.setOwnPin(h), 'PIN changed')) { S.profile.pinHash = h; m.close(); }
   };
+}
+
+// ============================================================ OneDrive sync engine
+let allReady = null;
+function ensureAllBills() {
+  if (!allReady) {
+    allReady = new Promise((res) => {
+      let first = true;
+      S.store.subscribeAllBills((list) => { S.allBills = list; if (first) { first = false; res(); } });
+    });
+  }
+  return allReady.then(() => S.allBills);
+}
+let lastErrShown = '';
+function startSync() {
+  od.completePending().then((a) => { if (a) { toast('OneDrive connected'); if (S.sync.itemId) runSync({ force: true }); } }).catch((e) => toast(e.message, 'err'));
+  const tick = () => {
+    if (!canEdit() || !S.sync.itemId || document.hidden || !od.configured()) return chip();
+    if (!od.status().connected) return chip();
+    runSync({});
+  };
+  setTimeout(tick, 1500);
+  setInterval(tick, SYNC_CHECK_SECONDS * 1000);
+  setInterval(chip, 30000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+}
+
+async function runSync({ force = false, manual = null, announce = false } = {}) {
+  if (S.syncBusy) return;
+  S.syncBusy = true; chip();
+  try {
+    let buf, cTag = S.sync.cTag || '', modified = S.sync.fileModified || '';
+    const srcFile = S.sync.itemId || 'manual';
+    if (manual) buf = manual.buf;
+    else {
+      if (!S.sync.itemId) throw new Error('Choose the workbook first.');
+      const info = await od.fileInfo(S.sync);
+      if (!force && info.cTag && info.cTag === S.sync.cTag) { S.syncErr = ''; return; }   // nothing new saved
+      const d = await od.download(S.sync);
+      buf = d.buf; cTag = d.cTag || info.cTag; modified = info.modified;
+    }
+    const parsed = await parseWorkbook(buf);
+    if (parsed.exported) throw new Error('This file was exported from the app. Use the working Excel instead.');
+    if (!parsed.bills.length) throw new Error('No bills found in this workbook. Check that it is the payables file.');
+    const all = await ensureAllBills();
+    const plan = planSync(parsed, all, S.vendors, S.settings, { srcFile, isAdmin: isAdmin() });
+    if (plan.ops.length) await S.store.writeMany(plan.ops);
+    const now = new Date().toISOString();
+    const rec = { cTag, fileModified: modified, syncedAt: now, by: S.user.email, warnings: plan.warnings.slice(0, 80), pendingCount: plan.pending.length };
+    if (plan.lines.length) Object.assign(rec, { lines: plan.lines.slice(0, 80), more: Math.max(0, plan.lines.length - 80), changedAt: now, counts: plan.counts });
+    await S.store.saveSync(rec);
+    S.syncErr = ''; lastErrShown = '';
+    if (plan.lines.length) S.store.addLog('sync.excel', `${plan.lines.length} changes from ${manual ? manual.name : S.sync.fileName}`);
+    else if (announce) toast('Already up to date with the Excel');
+    S.pending = plan.pending;
+    const tagKey = manual ? 'manual:' + manual.name : cTag;
+    let declined = {}; try { declined = JSON.parse(localStorage.getItem('mkf_declined')) || {}; } catch { /* ignore */ }
+    const fresh = plan.pending.filter((p) => !(declined.tag === tagKey && (declined.keys || []).includes(p.key)));
+    if (fresh.length) reviewPending(tagKey);
+  } catch (e) {
+    console.error(e);
+    S.syncErr = e.reconnect ? e.message : 'Sync problem: ' + e.message;
+    if (announce || (!e.reconnect && S.syncErr !== lastErrShown)) { toast(S.syncErr, 'err'); lastErrShown = S.syncErr; }
+  } finally {
+    S.syncBusy = false; chip();
+    if (S.view === 'data') render();
+  }
+}
+
+function reviewPending(tagKey = S.sync.cTag) {
+  const items = S.pending;
+  if (!items.length) return;
+  const m = openModal(`<h3>Confirm removal</h3>
+    <p class="muted">These items are no longer in the Excel. Nothing has been removed yet. Tick what should be removed from the app.</p>
+    <div class="pend">${items.map((it, i) => {
+      const locked = it.needsAdmin && !isAdmin();
+      return `<label class="f chk pend-row"><input type="checkbox" data-i="${i}" ${locked ? 'disabled' : 'checked'}> <span>${esc(it.text)}${locked ? ' <span class="warn-text">(an admin must confirm this)</span>' : ''}</span></label>`;
+    }).join('')}</div>
+    <div class="form-actions"><button class="btn ghost" id="pnot">Not now</button><button class="btn danger" id="pgo">Remove selected</button></div>`, { wide: true });
+  $('#pnot', m.el).onclick = () => {
+    localStorage.setItem('mkf_declined', JSON.stringify({ tag: tagKey, keys: items.map((x) => x.key) }));
+    m.close(); toast('Kept for now. You will be asked again when the Excel changes.');
+  };
+  $('#pgo', m.el).onclick = async () => {
+    const sel = $$('input[data-i]:checked', m.el).map((c) => items[+c.dataset.i]);
+    if (!sel.length) { m.close(); return; }
+    const all = await ensureAllBills();
+    const ops = removalOps(sel, new Map(all.map((b) => [b.id, b])), S.settings);
+    if (await guard(() => S.store.writeMany(ops), `${sel.length} items removed`)) {
+      S.store.addLog('sync.remove', sel.map((x) => x.text).join(' | ').slice(0, 480));
+      S.pending = items.filter((x) => !sel.includes(x));
+      const lines = sel.map((x) => 'Removed: ' + x.text.replace(/ is no longer in the Excel( PAYMENTS sheet)?| was recorded in the app, not in Excel/, ''));
+      const now = new Date().toISOString();
+      await S.store.saveSync({ lines: [...(S.sync.lines || []), ...lines].slice(-80), changedAt: now, pendingCount: S.pending.length });
+      m.close(); if (S.view === 'data') render();
+    }
+  };
+}
+
+const ago = (iso) => {
+  if (!iso) return '';
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return new Date(iso).toLocaleDateString('en-IN');
+};
+function chip() {
+  const c = $('#sync-chip'); if (!c) return;
+  const x = S.sync || {}, st = od.status();
+  let txt = '', cls = '', act = null;
+  if (!x.itemId && !x.syncedAt) { if (isAdmin()) { txt = 'Set up Excel sync'; cls = 'warn'; act = () => (location.hash = '#/data'); } }
+  else if (S.syncBusy) { txt = 'Syncing…'; cls = 'busy'; }
+  else if (canEdit() && od.configured() && st.expired) {
+    txt = 'Reconnect OneDrive'; cls = 'warn';
+    act = async () => { try { await od.connect(); S.syncErr = ''; runSync({ force: true, announce: true }); } catch (e) { toast(e.message, 'err'); } };
+  } else if (S.syncErr && canEdit() && st.connected) { txt = 'Sync problem'; cls = 'warn'; act = () => (location.hash = '#/data'); }
+  else { txt = x.syncedAt ? `Synced ${ago(x.syncedAt)}` : 'Waiting for first sync'; cls = st.connected && canEdit() ? 'ok' : ''; act = () => showChanges(); }
+  c.hidden = !txt; c.textContent = txt; c.className = 'sync-chip ' + cls; c.onclick = act;
+}
+function showChanges() {
+  const x = S.sync || {};
+  openModal(`<h3>Latest changes from Excel</h3><p class="muted">${x.changedAt ? new Date(x.changedAt).toLocaleString('en-IN') : 'No changes recorded yet'}${x.fileName ? ' · ' + esc(x.fileName) : ''}</p>
+    ${(x.lines || []).length ? `<ul class="chg">${x.lines.map((l) => `<li>${esc(l)}</li>`).join('')}${x.more ? `<li>and ${x.more} more</li>` : ''}</ul>` : ''}
+    <p class="fine">Last checked against the Excel ${ago(x.syncedAt)}.</p>`);
+}
+function maybeShowSummary() {
+  const x = S.sync || {}, card = $('#sync-card');
+  if (!x.changedAt || !(x.lines || []).length) return;
+  const seen = localStorage.getItem('mkf_seen_change');
+  if (seen === x.changedAt) return;
+  if (!seen && Date.now() - new Date(x.changedAt).getTime() > 3 * 86400000) { localStorage.setItem('mkf_seen_change', x.changedAt); return; }
+  const top = x.lines.slice(0, 6), rest = x.lines.length - top.length + (x.more || 0);
+  card.innerHTML = `<div class="sc-head"><b>Updated from Excel</b><span>${ago(x.changedAt)}</span></div>
+    <ul class="chg">${top.map((l) => `<li>${esc(l)}</li>`).join('')}</ul>
+    <div class="sc-foot">${rest > 0 ? `<button class="btn sm" id="scall">See all ${x.lines.length + (x.more || 0)}</button>` : '<span></span>'}<button class="btn sm primary" id="scok">OK</button></div>`;
+  card.hidden = false;
+  const done = () => { localStorage.setItem('mkf_seen_change', x.changedAt); card.hidden = true; };
+  $('#scok', card).onclick = done;
+  if ($('#scall', card)) $('#scall', card).onclick = () => { done(); showChanges(); };
 }
 
 boot();
