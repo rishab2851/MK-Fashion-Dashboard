@@ -15,6 +15,10 @@ export const firebaseConfig = {
   messagingSenderId: '737636206304',
   appId: '1:737636206304:web:e513e523a18b1e8b8ff285',
 };
-
+export const msConfig = {
+  clientId: '42390595-53c0-4201-9eaf-a549add7d524',
+  authority: 'consumers',
+};
+export const SYNC_CHECK_SECONDS = 30;
 // Screen locks after this many minutes without any tap or key press. The PIN unlocks it.
 export const IDLE_LOCK_MINUTES = 10;
