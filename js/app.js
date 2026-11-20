@@ -651,27 +651,63 @@ VIEWS.data = (el) => {
 
 async function pickWorkbook() {
   const m = openModal(`<h3>Choose the workbook in OneDrive</h3>
-    <div class="toolbar"><input type="search" class="grow" id="wq" placeholder="Part of the file name" value="Vendor"><button class="btn" id="wgo">Search</button></div>
-    <div id="wl"><p class="muted">Searching…</p></div>`, { wide: true });
-  const go = async () => {
-    $('#wl', m.el).innerHTML = '<p class="muted">Searching…</p>';
-    try {
-      const list = await od.findWorkbooks($('#wq', m.el).value.trim() || 'xlsx');
-      $('#wl', m.el).innerHTML = list.length ? `<div class="tbl-wrap"><table class="t cards"><tbody>${list.map((f, i) => `<tr class="click" data-i="${i}">${td('File', `<span class="vname">${esc(f.name)}</span>`, 'first')}${td('Folder', esc(f.path))}${td('Saved', new Date(f.modified).toLocaleString('en-IN'))}</tr>`).join('')}</tbody></table></div>`
-        : '<p class="muted">No Excel files found. Try another part of the name, or "xlsx".</p>';
-      $$('#wl tr[data-i]', m.el).forEach((tr) => (tr.onclick = async () => {
-        const f = list[+tr.dataset.i];
-        if (!(await confirmBox('Use this workbook?', `<b>${esc(f.name)}</b> in ${esc(f.path)}. The app will show exactly what this file contains.`, 'Use it'))) return;
-        if (await guard(() => S.store.saveSync({ driveId: f.driveId, itemId: f.itemId, fileName: f.name, path: f.path, cTag: '', lines: [], warnings: [] }), 'Workbook selected')) {
-          S.store.addLog('sync.file', f.name);
-          S.sync = { ...S.sync, driveId: f.driveId, itemId: f.itemId, fileName: f.name, path: f.path, cTag: '' };
-          runSync({ force: true, announce: true });
-        }
-      }));
-    } catch (e) { $('#wl', m.el).innerHTML = `<div class="notice warn">${esc(e.message)}</div>`; }
+    <div class="chips" style="margin-bottom:12px"><button class="chip on" data-t="browse">Browse folders</button><button class="chip" data-t="search">Search</button><button class="chip" data-t="link">Paste link</button></div>
+    <div id="wp"></div>`, { wide: true });
+  const box = $('#wp', m.el);
+  const choose = async (f) => {
+    if (!(await confirmBox('Use this workbook?', `<b>${esc(f.name)}</b> in ${esc(f.path || '/')}. The app will show exactly what this file contains.`, 'Use it'))) return;
+    if (await guard(() => S.store.saveSync({ driveId: f.driveId, itemId: f.itemId, fileName: f.name, path: f.path, cTag: '', lines: [], warnings: [] }), 'Workbook selected')) {
+      S.store.addLog('sync.file', f.name);
+      S.sync = { ...S.sync, driveId: f.driveId, itemId: f.itemId, fileName: f.name, path: f.path, cTag: '' };
+      runSync({ force: true, announce: true });
+    }
   };
-  $('#wgo', m.el).onclick = go; $('#wq', m.el).onkeydown = (e) => { if (e.key === 'Enter') go(); };
-  go();
+  const fileRows = (list, emptyMsg) => (list.length ? `<div class="tbl-wrap"><table class="t cards"><tbody>${list.map((f, i) => `<tr class="click" data-i="${i}">
+      ${td(f.isFolder ? 'Folder' : 'File', `${f.isFolder ? '📁 ' : '📗 '}<span class="vname">${esc(f.name)}</span>`, 'first')}
+      ${td(f.isFolder ? 'Items' : 'Saved', f.isFolder ? `${f.childCount} items` : new Date(f.modified).toLocaleString('en-IN'))}</tr>`).join('')}</tbody></table></div>`
+    : `<p class="muted">${emptyMsg}</p>`);
+  const bindRows = (list, onFolder) => $$('#wp tr[data-i]', m.el).forEach((tr) => (tr.onclick = () => {
+    const f = list[+tr.dataset.i]; f.isFolder ? onFolder(f) : choose(f);
+  }));
+  const trail = [];
+  const browse = async (folder) => {
+    box.innerHTML = '<p class="muted">Opening…</p>';
+    try {
+      const list = await od.listFolder(folder);
+      const crumbs = [{ name: 'My OneDrive', f: null }, ...trail.map((t) => ({ name: t.name, f: t }))];
+      box.innerHTML = `<div class="fine" style="margin-bottom:8px">${crumbs.map((c, i) => `<a href="javascript:void 0" data-c="${i}">${esc(c.name)}</a>`).join(' › ')}</div>
+        ${fileRows(list, 'No folders or Excel files here.')}`;
+      $$('a[data-c]', box).forEach((a) => (a.onclick = () => { trail.length = +a.dataset.c; browse(trail[trail.length - 1] || null); }));
+      bindRows(list, (f) => { trail.push(f); browse(f); });
+    } catch (e) { box.innerHTML = `<div class="notice warn">${esc(e.message)}</div>`; }
+  };
+  const search = () => {
+    box.innerHTML = `<div class="toolbar"><input type="search" class="grow" id="wq" placeholder="Part of the file name" value="Vendor Payments"><button class="btn" id="wgo">Search</button></div><div id="wl"></div>
+      <p class="fine">A file uploaded recently may take some time to appear in search. Use Browse folders instead.</p>`;
+    const go = async () => {
+      $('#wl', box).innerHTML = '<p class="muted">Searching…</p>';
+      try {
+        const list = await od.findWorkbooks($('#wq', box).value.trim() || 'xlsx');
+        $('#wl', box).innerHTML = fileRows(list, 'No Excel files found. Try Browse folders.');
+        bindRows(list, () => {});
+      } catch (e) { $('#wl', box).innerHTML = `<div class="notice warn">${esc(e.message)}</div>`; }
+    };
+    $('#wgo', box).onclick = go; $('#wq', box).onkeydown = (e) => { if (e.key === 'Enter') go(); };
+    go();
+  };
+  const link = () => {
+    box.innerHTML = `<p class="fine">In OneDrive, select the file, choose <b>Share</b> then <b>Copy link</b> (or open the file and copy the address), and paste it here.</p>
+      <div class="toolbar"><input type="text" class="grow" id="wlink" placeholder="https://1drv.ms/x/…  or  https://onedrive.live.com/…"><button class="btn primary" id="wlgo">Open</button></div><div id="wlr"></div>`;
+    $('#wlgo', box).onclick = async () => {
+      try { choose(await od.fromLink($('#wlink', box).value)); }
+      catch (e) { $('#wlr', box).innerHTML = `<div class="notice warn">${esc(e.message)}</div>`; }
+    };
+  };
+  $$('.chip[data-t]', m.el).forEach((c) => (c.onclick = () => {
+    $$('.chip[data-t]', m.el).forEach((x) => x.classList.toggle('on', x === c));
+    ({ browse: () => browse(trail[trail.length - 1] || null), search, link })[c.dataset.t]();
+  }));
+  browse(null);
 }
 
 // ---------------------------------------------------------------- settings & users

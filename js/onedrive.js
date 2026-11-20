@@ -137,11 +137,37 @@ const SEL = 'id,name,cTag,eTag,size,lastModifiedDateTime,lastModifiedBy,parentRe
 const pathOf = (it) => ((it.parentReference?.path || '').replace(/^\/drive\/root:?/, '') || '/') ;
 
 export async function findWorkbooks(q) {
-  const term = (q || 'xlsx').replace(/'/g, "''");
+  // OneDrive search treats NAME_WITH_UNDERSCORES as one word, so search each part as well
+  const term = (q || 'xlsx').replace(/[_\-.]+/g, ' ').trim().replace(/'/g, "''");
   const j = await graph(`/me/drive/root/search(q='${encodeURIComponent(term)}')?$top=100&$select=${SEL},file`);
   return (j.value || []).filter((it) => it.file && /\.xls[xm]$/i.test(it.name))
     .map((it) => ({ itemId: it.id, driveId: it.parentReference?.driveId, name: it.name, path: pathOf(it), modified: it.lastModifiedDateTime, size: it.size }))
     .sort((a, b) => (b.modified || '').localeCompare(a.modified || ''));
+}
+const mapItem = (it) => ({
+  itemId: it.id, driveId: it.parentReference?.driveId, name: it.name, path: pathOf(it), modified: it.lastModifiedDateTime,
+  size: it.size, isFolder: !!it.folder, childCount: it.folder?.childCount || 0, isExcel: !!it.file && /\.xls[xm]$/i.test(it.name),
+});
+// Browse a folder (null = OneDrive home). Does not depend on search indexing, so new files show at once.
+export async function listFolder(folder) {
+  let url = folder ? `/drives/${folder.driveId}/items/${folder.itemId}/children` : '/me/drive/root/children';
+  url += `?$top=200&$select=${SEL},folder,file`;
+  const out = [];
+  while (url) {
+    const j = await graph(url);
+    out.push(...(j.value || []).map(mapItem));
+    url = j['@odata.nextLink'] ? j['@odata.nextLink'].replace(GRAPH, '') : null;
+  }
+  return out.filter((x) => x.isFolder || x.isExcel)
+    .sort((a, b) => (b.isFolder - a.isFolder) || a.name.localeCompare(b.name));
+}
+// Open the file from a OneDrive link ("Share > Copy link" or the address bar when the file is open).
+export async function fromLink(link) {
+  const enc = 'u!' + btoa(unescape(encodeURIComponent(link.trim()))).replace(/=+$/, '').replace(/\//g, '_').replace(/\+/g, '-');
+  const it = await graph(`/shares/${enc}/driveItem?$select=${SEL},file`);
+  const m = mapItem(it);
+  if (!m.isExcel) throw new Error('That link is not an Excel workbook.');
+  return m;
 }
 export async function fileInfo(ref) {
   const it = await graph(`/drives/${ref.driveId}/items/${ref.itemId}?$select=${SEL}`);
